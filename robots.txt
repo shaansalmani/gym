@@ -1,5 +1,0 @@
-User-agent: *
-Allow: /
-
-Sitemap: https://shaansalmani.github.io/gym/sitemap.xml
-
