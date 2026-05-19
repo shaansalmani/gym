@@ -1,0 +1,5 @@
+# Replace studio-fitness.example.com with your final live domain before launch
+User-agent: *
+Allow: /
+
+Sitemap: https://studio-fitness.example.com/sitemap.xml

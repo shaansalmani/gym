@@ -21,6 +21,15 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color('#fbf7f2');
+const themeToggle = document.querySelector('#theme-toggle');
+const THEME_STORAGE_KEY = 'studio-theme';
+const LIGHT_THEME = 'light';
+const DARK_THEME = 'dark';
+const LIGHT_BG = '#fbf7f2';
+const DARK_BG = '#0c121a';
+let model = null;
+let activeTheme = LIGHT_THEME;
+let shadowOpacityMultiplier = 1;
 
 const camera = new THREE.PerspectiveCamera(38, window.innerWidth / window.innerHeight, 0.1, 100);
 camera.position.set(0, 0.9, 3.2);
@@ -39,6 +48,63 @@ key.shadow.camera.left = -6; key.shadow.camera.right = 6; key.shadow.camera.top 
 scene.add(key);
 const fill = new THREE.DirectionalLight(0xffffff, 0.45); fill.position.set(-3, -1, -2); scene.add(fill);
 const rim = new THREE.PointLight(0xffffff, 0.18, 10); rim.position.set(-2, 2, -2); scene.add(rim);
+
+function applyTheme(themeName, options = {}){
+  const { persist = true } = options;
+  const isDark = themeName === DARK_THEME;
+  activeTheme = isDark ? DARK_THEME : LIGHT_THEME;
+  document.body.classList.toggle('dark-mode', isDark);
+  if (themeToggle) themeToggle.checked = isDark;
+  scene.background.set(isDark ? DARK_BG : LIGHT_BG);
+
+  if (isDark) {
+    renderer.toneMappingExposure = 1.02;
+    ambient.intensity = 0.34;
+    key.intensity = 1.75;
+    key.position.set(-3.3, 5.6, 2.4);
+    fill.intensity = 0.72;
+    fill.position.set(2.4, 0.7, 1.7);
+    rim.intensity = 0.46;
+    rim.position.set(-2.2, 2.7, -2.5);
+    shadowOpacityMultiplier = 0.8;
+  } else {
+    renderer.toneMappingExposure = 0.82;
+    ambient.intensity = 0.18;
+    key.intensity = 1.2;
+    key.position.set(2.8, 5.2, 1.8);
+    fill.intensity = 0.45;
+    fill.position.set(-3, -1, -2);
+    rim.intensity = 0.18;
+    rim.position.set(-2, 2, -2);
+    shadowOpacityMultiplier = 1;
+  }
+
+  if (model) {
+    model.traverse(n => {
+      if (!n.isMesh || !n.material) return;
+      n.material.envMapIntensity = isDark ? 1.3 : 1.0;
+      n.material.metalness = Math.max(n.material.metalness ?? 0.6, 0.6);
+      n.material.roughness = Math.min(n.material.roughness ?? 0.35, isDark ? 0.55 : 0.65);
+      n.material.needsUpdate = true;
+    });
+  }
+
+  if (persist) localStorage.setItem(THEME_STORAGE_KEY, activeTheme);
+}
+
+function getInitialTheme(){
+  const storedTheme = localStorage.getItem(THEME_STORAGE_KEY);
+  if (storedTheme === LIGHT_THEME || storedTheme === DARK_THEME) return storedTheme;
+  const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  return prefersDark ? DARK_THEME : LIGHT_THEME;
+}
+
+applyTheme(getInitialTheme(), { persist: false });
+if (themeToggle) {
+  themeToggle.addEventListener('change', () => {
+    applyTheme(themeToggle.checked ? DARK_THEME : LIGHT_THEME);
+  });
+}
 
 const ground = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), new THREE.ShadowMaterial({ opacity: 0 }));
 ground.rotation.x = -Math.PI / 2; ground.position.y = -1.2; ground.receiveShadow = true; scene.add(ground);
@@ -81,7 +147,6 @@ function playIntroScale(target){
   }
 }
 
-let model = null;
 const loader = new GLTFLoader();
 const raycaster = new THREE.Raycaster();
 const pointerNDC = new THREE.Vector2();
@@ -89,6 +154,11 @@ let isDragging = false;
 let dragPlane = new THREE.Plane();
 let dragOffset = new THREE.Vector3();
 let dragObjects = [];
+const TOUCH_ROTATE_SPEED = 0.018;
+let isTouchRotating = false;
+let activeTouchId = null;
+let lastTouchX = 0;
+let lastTouchY = 0;
 
 function createFallbackModel(){
   const group = new THREE.Group();
@@ -104,6 +174,7 @@ function createFallbackModel(){
   // start slightly above and larger for intro animation
   group.position.y = MODEL_INITIAL_Y; group.scale.set(1.35,1.35,1.35);
   scene.add(group); model = group;
+  applyTheme(activeTheme, { persist: false });
   // prepare drag objects and play intro scale animation
   updateDragObjects();
   playIntroScale(model);
@@ -147,6 +218,7 @@ loader.load('dumbbell.glb', gltf => {
 
   // expose pivot as the model that animations will touch
   model = pivot;
+  applyTheme(activeTheme, { persist: false });
   // prepare drag objects and intro state
   updateDragObjects();
   model.scale.set(1.35,1.35,1.35);
@@ -198,12 +270,57 @@ function updateDragObjects(){
   model.traverse(n => { if(n.isMesh) dragObjects.push(n); });
 }
 
-document.addEventListener('pointermove', e => {
-  pointerX = (e.clientX / innerWidth) * 2 - 1; pointerY = (e.clientY / innerHeight) * 2 - 1;
-  // update normalized device coords for raycasting
-  pointerNDC.x = (e.clientX / window.innerWidth) * 2 - 1;
-  pointerNDC.y = -(e.clientY / window.innerHeight) * 2 + 1;
+function setPointerFromClient(clientX, clientY){
+  pointerX = (clientX / innerWidth) * 2 - 1;
+  pointerY = (clientY / innerHeight) * 2 - 1;
+  pointerNDC.x = (clientX / window.innerWidth) * 2 - 1;
+  pointerNDC.y = -(clientY / window.innerHeight) * 2 + 1;
+}
 
+function isInteractiveElementTarget(target){
+  return !!(target && target.closest && target.closest('a,button,input,textarea,select,label'));
+}
+
+function settleModelToScrollPosition(){
+  const finalY = (typeof scrollProxy.y === 'number') ? scrollProxy.y : MODEL_INITIAL_Y;
+  if (window.gsap && model) {
+    gsap.to(model.position, { x: 0, y: finalY, z: 0, duration: 0.7, ease: 'power3.out' });
+  } else if (model) {
+    model.position.set(0, finalY, 0);
+  }
+}
+
+function isInsideModelTouchHotspot(clientX, clientY){
+  if (!model) return false;
+  const projected = new THREE.Vector3();
+  model.getWorldPosition(projected);
+  projected.project(camera);
+  if (projected.z > 1) return false;
+  const modelScreenX = (projected.x + 1) * 0.5 * window.innerWidth;
+  const modelScreenY = (-projected.y + 1) * 0.5 * window.innerHeight;
+  const dx = clientX - modelScreenX;
+  const dy = clientY - modelScreenY;
+  const radius = Math.min(window.innerWidth, window.innerHeight) * 0.42;
+  return (dx * dx + dy * dy) <= (radius * radius);
+}
+
+function findTouchById(touchList, identifier){
+  for (let i = 0; i < touchList.length; i += 1) {
+    if (touchList[i].identifier === identifier) return touchList[i];
+  }
+  return null;
+}
+
+function endTouchRotation(){
+  isTouchRotating = false;
+  activeTouchId = null;
+  lastTouchX = 0;
+  lastTouchY = 0;
+}
+
+document.addEventListener('pointermove', e => {
+  if (e.pointerType && e.pointerType !== 'mouse' && e.pointerType !== 'pen') return;
+  setPointerFromClient(e.clientX, e.clientY);
   // handle active dragging
   if (isDragging && model) {
     raycaster.setFromCamera(pointerNDC, camera);
@@ -227,11 +344,11 @@ document.addEventListener('pointermove', e => {
 
 // pointer down/up for dragging
 document.addEventListener('pointerdown', e => {
+  if (e.pointerType && e.pointerType !== 'mouse' && e.pointerType !== 'pen') return;
   if (e.button !== 0) return;
   // don't start drag when clicking interactive UI elements
-  if (e.target.closest && e.target.closest('a,button,input,textarea,select,label')) return;
-  pointerNDC.x = (e.clientX / window.innerWidth) * 2 - 1;
-  pointerNDC.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  if (isInteractiveElementTarget(e.target)) return;
+  setPointerFromClient(e.clientX, e.clientY);
   raycaster.setFromCamera(pointerNDC, camera);
   if (dragObjects.length === 0) updateDragObjects();
   const hits = raycaster.intersectObjects(dragObjects, true);
@@ -247,35 +364,135 @@ document.addEventListener('pointerdown', e => {
 });
 
 document.addEventListener('pointerup', e => {
+  if (e.pointerType && e.pointerType !== 'mouse' && e.pointerType !== 'pen') return;
   if (e.button !== 0) return;
   if (!isDragging) return;
   isDragging = false;
   document.body.style.cursor = '';
   // animate model back to its scroll-driven position
-  const finalY = (typeof scrollProxy.y === 'number') ? scrollProxy.y : MODEL_INITIAL_Y;
-  if (window.gsap && model) {
-    gsap.to(model.position, { x: 0, y: finalY, z: 0, duration: 0.7, ease: 'power3.out' });
-  } else if (model) {
-    model.position.set(0, finalY, 0);
-  }
+  settleModelToScrollPosition();
+});
+
+document.addEventListener('pointercancel', e => {
+  if (e.pointerType && e.pointerType !== 'mouse' && e.pointerType !== 'pen') return;
+  if (!isDragging) return;
+  isDragging = false;
+  document.body.style.cursor = '';
+  settleModelToScrollPosition();
+});
+
+document.addEventListener('touchstart', e => {
+  if (!model) return;
+  if (e.touches.length !== 1) return;
+  if (isInteractiveElementTarget(e.target)) return;
+  const touch = e.changedTouches[0];
+  if (!touch) return;
+  setPointerFromClient(touch.clientX, touch.clientY);
+  raycaster.setFromCamera(pointerNDC, camera);
+  if (dragObjects.length === 0) updateDragObjects();
+  const hits = raycaster.intersectObjects(dragObjects, true);
+  if (!hits.length && !isInsideModelTouchHotspot(touch.clientX, touch.clientY)) return;
+  e.preventDefault();
+  isTouchRotating = true;
+  activeTouchId = touch.identifier;
+  lastTouchX = touch.clientX;
+  lastTouchY = touch.clientY;
+}, { passive: false });
+
+document.addEventListener('touchmove', e => {
+  if (!isTouchRotating || !model) return;
+  const touch = findTouchById(e.touches, activeTouchId);
+  if (!touch) return;
+  e.preventDefault();
+  const deltaX = touch.clientX - lastTouchX;
+  const deltaY = touch.clientY - lastTouchY;
+  lastTouchX = touch.clientX;
+  lastTouchY = touch.clientY;
+  setPointerFromClient(touch.clientX, touch.clientY);
+  model.rotation.y += deltaX * TOUCH_ROTATE_SPEED;
+  model.rotation.x += deltaY * TOUCH_ROTATE_SPEED * 0.35;
+  rotationTarget = 0;
+}, { passive: false });
+
+document.addEventListener('touchend', e => {
+  if (!isTouchRotating) return;
+  if (!findTouchById(e.changedTouches, activeTouchId)) return;
+  endTouchRotation();
+});
+
+document.addEventListener('touchcancel', e => {
+  if (!isTouchRotating) return;
+  if (!findTouchById(e.changedTouches, activeTouchId)) return;
+  endTouchRotation();
 });
 
 let rotationVelocity = 0;
 let rotationTarget = 0;
 let lastScrollAt = 0;
-// only change rotation when user scrolls; capture a smooth target and lerp toward it
-lenis.on('scroll', e => {
-  const v = Math.min(6, Math.abs(e.velocity || 0));
-  // robust direction detection: prefer delta, then string/number direction
-  let dirSign = 0;
-  if (typeof e.delta === 'number') dirSign = Math.sign(e.delta);
-  else if (typeof e.direction === 'string') dirSign = (e.direction === 'down' || e.direction === 'right') ? 1 : -1;
-  else if (typeof e.direction === 'number') dirSign = Math.sign(e.direction);
-  // fallback
-  if (dirSign === 0) dirSign = (e.velocity && e.velocity !== 0) ? 1 : 0;
-  rotationTarget = dirSign * v * 0.04;
+const SCROLL_TO_ROTATE_FACTOR = 0.0032;
+const SCROLL_TO_ROTATE_MAX = 0.2;
+const TOUCH_SCROLL_ROTATE_BOOST = 2.4;
+const TOUCH_SCROLL_ROTATE_MAX = 0.45;
+const TOUCH_SCROLL_MEMORY_MS = 900;
+let lastNativeScrollY = window.scrollY || document.documentElement.scrollTop || 0;
+let lastTouchScrollInputAt = 0;
+
+// Track recent touch activity so mobile scroll gets a stronger rotation response.
+document.addEventListener('touchstart', () => {
+  lastTouchScrollInputAt = performance.now();
+}, { passive: true });
+document.addEventListener('touchmove', () => {
+  lastTouchScrollInputAt = performance.now();
+}, { passive: true });
+
+function applyScrollDrivenRotation(deltaY, boost = 1, maxRotation = SCROLL_TO_ROTATE_MAX){
+  if (!Number.isFinite(deltaY) || Math.abs(deltaY) < 0.01) return;
+  rotationTarget = THREE.MathUtils.clamp(
+    deltaY * SCROLL_TO_ROTATE_FACTOR * boost,
+    -maxRotation,
+    maxRotation
+  );
   lastScrollAt = performance.now();
+}
+
+function isRecentTouchScrollSource(){
+  return (performance.now() - lastTouchScrollInputAt) < TOUCH_SCROLL_MEMORY_MS;
+}
+
+// Raw wheel/touch delta from Lenis (works well on mobile touch gestures).
+lenis.on('virtual-scroll', payload => {
+  if (payload && typeof payload.deltaY === 'number') {
+    const eventType = payload.event && payload.event.type ? payload.event.type : '';
+    const isTouchSource = eventType.startsWith('touch');
+    if (isTouchSource) lastTouchScrollInputAt = performance.now();
+    const boost = isTouchSource ? TOUCH_SCROLL_ROTATE_BOOST : 1;
+    const maxRotation = isTouchSource ? TOUCH_SCROLL_ROTATE_MAX : SCROLL_TO_ROTATE_MAX;
+    applyScrollDrivenRotation(payload.deltaY, boost, maxRotation);
+  }
 });
+
+// Fallback for setups where virtual-scroll or velocity can be inconsistent.
+lenis.on('scroll', e => {
+  const isTouchSource = isRecentTouchScrollSource();
+  const boost = isTouchSource ? TOUCH_SCROLL_ROTATE_BOOST : 1;
+  const maxRotation = isTouchSource ? TOUCH_SCROLL_ROTATE_MAX : SCROLL_TO_ROTATE_MAX;
+  if (typeof e.velocity === 'number' && Math.abs(e.velocity) > 0.001) {
+    applyScrollDrivenRotation(e.velocity * 46, boost, maxRotation);
+    return;
+  }
+  if (typeof e.delta === 'number') applyScrollDrivenRotation(e.delta, boost, maxRotation);
+});
+
+// Native scroll fallback to guarantee touch-scroll rotation on phones.
+window.addEventListener('scroll', () => {
+  const currentY = window.scrollY || document.documentElement.scrollTop || 0;
+  const deltaY = currentY - lastNativeScrollY;
+  lastNativeScrollY = currentY;
+  const isTouchSource = isRecentTouchScrollSource();
+  const boost = isTouchSource ? TOUCH_SCROLL_ROTATE_BOOST : 1;
+  const maxRotation = isTouchSource ? TOUCH_SCROLL_ROTATE_MAX : SCROLL_TO_ROTATE_MAX;
+  applyScrollDrivenRotation(deltaY, boost, maxRotation);
+}, { passive: true });
 
 const clock = new THREE.Clock();
 function animate(time){
@@ -301,7 +518,7 @@ function animate(time){
     s = THREE.MathUtils.clamp(s, 0.5, 2.0);
     shadowSprite.scale.set(s, s, 1);
     const so = THREE.MathUtils.mapLinear(model.position.y, SCROLL_END_Y * 1.15, MODEL_INITIAL_Y, 0.82, 0.14);
-    shadowSprite.material.opacity = THREE.MathUtils.clamp(so, 0.12, 0.95);
+    shadowSprite.material.opacity = THREE.MathUtils.clamp(so * shadowOpacityMultiplier, 0.08, 0.95);
   }
   camera.position.x = THREE.MathUtils.lerp(camera.position.x, pointerX * 0.26, 0.06);
   camera.position.y = THREE.MathUtils.lerp(camera.position.y, 0.9 + pointerY * -0.06, 0.06);
